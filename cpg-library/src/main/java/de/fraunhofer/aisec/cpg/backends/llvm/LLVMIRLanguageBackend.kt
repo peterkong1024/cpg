@@ -26,13 +26,22 @@
 package de.fraunhofer.aisec.cpg.backends.llvm
 
 import de.fraunhofer.aisec.cpg.backends.LanguageBackend
+import de.fraunhofer.aisec.cpg.frontends.LanguageFrontend.log
 import de.fraunhofer.aisec.cpg.graph.HasType
-import de.fraunhofer.aisec.cpg.graph.declarations.FunctionDeclaration
-import de.fraunhofer.aisec.cpg.graph.declarations.TranslationUnitDeclaration
+import de.fraunhofer.aisec.cpg.graph.NodeBuilder.newRecordDeclaration
+import de.fraunhofer.aisec.cpg.graph.declarations.*
 import de.fraunhofer.aisec.cpg.graph.statements.CompoundStatement
+import de.fraunhofer.aisec.cpg.graph.statements.DeclarationStatement
 import de.fraunhofer.aisec.cpg.graph.statements.ReturnStatement
 import de.fraunhofer.aisec.cpg.graph.statements.Statement
+import de.fraunhofer.aisec.cpg.graph.statements.expressions.BinaryOperator
+import de.fraunhofer.aisec.cpg.graph.statements.expressions.DeclaredReferenceExpression
+import de.fraunhofer.aisec.cpg.graph.statements.expressions.Expression
+import de.fraunhofer.aisec.cpg.graph.statements.expressions.Literal
 import de.fraunhofer.aisec.cpg.graph.types.IncompleteType
+import de.fraunhofer.aisec.cpg.graph.types.ObjectType
+import de.fraunhofer.aisec.cpg.graph.types.PointerType
+import de.fraunhofer.aisec.cpg.graph.types.Type
 import org.bytedeco.llvm.LLVM.*
 import org.bytedeco.llvm.global.LLVM.*
 
@@ -40,11 +49,21 @@ class LLVMIRLanguageBackend : LanguageBackend<LLVMTypeRef>() {
     lateinit var ctx: LLVMContextRef
     lateinit var builder: LLVMBuilderRef
 
+    private var typeMap: MutableMap<Type, LLVMTypeRef> = mutableMapOf()
+    private var variableMap: MutableMap<Declaration, LLVMValueRef> = mutableMapOf()
+
     override fun generate(tu: TranslationUnitDeclaration) {
         ctx = LLVMContextCreate()
         builder = LLVMCreateBuilderInContext(ctx)
 
         var mod = LLVMModuleCreateWithName(tu.name)
+
+        // TODO: this should have been inferred
+        tu.addDeclaration(newRecordDeclaration("std.string", "struct", ""))
+
+        for (record in tu.declarations.filterIsInstance<RecordDeclaration>()) {
+            generateStruct(mod, record)
+        }
 
         // LLVMPrintModuleToFile
         for (func in tu.declarations.filterIsInstance<FunctionDeclaration>()) {
@@ -59,11 +78,19 @@ class LLVMIRLanguageBackend : LanguageBackend<LLVMTypeRef>() {
         println(LLVMPrintModuleToString(mod).string)
     }
 
+    private fun generateStruct(mod: LLVMModuleRef, record: RecordDeclaration) {
+        val ctx = LLVMGetModuleContext(mod)
+        val structType = LLVMStructCreateNamed(ctx, record.name)
+        LLVMStructSetBody(structType, LLVMTypeRef(), 0, 0)
+
+        typeMap[record.toType()] = structType
+    }
+
     private fun generateFunction(mod: LLVMModuleRef, func: FunctionDeclaration) {
         val returnType = this.typeOf(func)
         val functionType = LLVMFunctionType(returnType, LLVMTypeRef(), 0, 0)
 
-        var valueRef = LLVMAddFunction(mod, func.name, functionType)
+        val valueRef = LLVMAddFunction(mod, func.name, functionType)
 
         func.body?.let {
             // handle the function body
@@ -88,6 +115,26 @@ class LLVMIRLanguageBackend : LanguageBackend<LLVMTypeRef>() {
     private fun generateStatement(stmt: Statement) {
         if (stmt is ReturnStatement) {
             generateReturnStatement(stmt)
+        } else if (stmt is DeclarationStatement) {
+            generateDeclarationStatement(stmt)
+        } else if (stmt is Expression) {
+            generateExpression(stmt)
+        }
+    }
+
+    private fun generateDeclarationStatement(stmt: DeclarationStatement) {
+        // TODO: support multiple declarations
+        var decl = stmt.singleDeclaration
+
+        // only variable declarations for now
+        (decl as? VariableDeclaration)?.let {
+            val type = typeOf(decl)
+
+            // just like LLVM, we are handling everything as an alloca. we might be able to optimize
+            // this later, e.g., when variables can be directly created on the stack
+            val valueRef = LLVMBuildAlloca(builder, type, decl.name)
+
+            variableMap.put(decl, valueRef)
         }
     }
 
@@ -99,10 +146,97 @@ class LLVMIRLanguageBackend : LanguageBackend<LLVMTypeRef>() {
         return valueRef
     }
 
-    override fun typeOf(node: HasType): LLVMTypeRef {
-        return if (node.type is IncompleteType && node.type.name == "void") {
-            LLVMVoidType()
+    private fun generateExpression(expression: Expression): LLVMValueRef {
+        return if (expression is BinaryOperator) {
+            generateBinaryOperator(expression)
+        } else if (expression is DeclaredReferenceExpression) {
+            generateDeclRef(expression)
+        } else if (expression is Literal<*>) {
+            generateLiteral(expression)
         } else {
+            LLVMValueRef()
+        }
+    }
+
+    private fun generateLiteral(expression: Literal<*>): LLVMValueRef {
+        val type = typeOf(expression)
+
+        return LLVMConstInt(type, (expression.value as Int).toLong(), 0)
+    }
+
+    private fun generateBinaryOperator(expression: BinaryOperator): LLVMValueRef {
+        if (expression.operatorCode == "=") {
+            val lhs = expression.lhs
+
+            if (lhs is DeclaredReferenceExpression) {
+                val rhsValue = generateExpression(expression.rhs)
+                log.debug("Trying to store something in {}", lhs.name)
+
+                val valueRef = variableMap[(lhs as DeclaredReferenceExpression).refersTo]
+
+                valueRef?.let {
+                    return LLVMBuildStore(builder, rhsValue, valueRef)
+                }
+
+                // we are storing something in our existing value
+                // lets find out what it is
+
+            }
+            // lhs
+
+            // rhs
+            // LLVMBuildStore(builder, )
+        } else if (expression.operatorCode == "*") {
+            log.debug("Handling mul")
+
+            val valueRef =
+                LLVMBuildMul(
+                    builder,
+                    generateExpression(expression.lhs),
+                    generateExpression(expression.rhs),
+                    ""
+                )
+
+            return valueRef
+        } else if (expression.operatorCode == ">>") {
+            return LLVMBuildLShr(
+                builder,
+                generateExpression(expression.lhs),
+                generateExpression(expression.rhs),
+                ""
+            )
+        }
+
+        log.error(
+            "Not handling operatorCode {}. This will probably crash now",
+            expression.operatorCode
+        )
+        return LLVMValueRef()
+    }
+
+    private fun generateDeclRef(ref: DeclaredReferenceExpression): LLVMValueRef {
+        val valueRef = variableMap[ref.refersTo]
+
+        // in order to access this variable, we need to load it
+        return LLVMBuildLoad(builder, valueRef, "")
+    }
+
+    override fun typeOf(node: HasType): LLVMTypeRef {
+        return typeFrom(node.type)
+    }
+
+    override fun typeFrom(type: Type): LLVMTypeRef {
+        return if (type is IncompleteType && type.name == "void") {
+            LLVMVoidType()
+        } else if (type is PointerType) {
+            LLVMPointerType(typeFrom(type.elementType), 0)
+        } else if (type is ObjectType && type.name == "int") {
+            LLVMIntType(32)
+        } else if (type is ObjectType) {
+            // try to look it up in the typeMap
+            typeMap[type] ?: LLVMIntType(64)
+        } else {
+            log.error("Not translating type {} yet. Assuming i64", type.typeName)
             LLVMIntType(64)
         }
     }

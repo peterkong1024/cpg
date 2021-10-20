@@ -25,11 +25,18 @@
  */
 package de.fraunhofer.aisec.cpg.backends
 
+import de.fraunhofer.aisec.cpg.frontends.LanguageFrontend
 import de.fraunhofer.aisec.cpg.graph.HasType
 import de.fraunhofer.aisec.cpg.graph.declarations.TranslationUnitDeclaration
+import de.fraunhofer.aisec.cpg.graph.types.Type
+import org.slf4j.Logger
+import org.slf4j.LoggerFactory
 
 /** A language backend */
 abstract class LanguageBackend<TypeClass> {
+    val log: Logger = LoggerFactory.getLogger(LanguageFrontend::class.java)
+
     abstract fun generate(tu: TranslationUnitDeclaration)
     abstract fun typeOf(node: HasType): TypeClass
+    abstract fun typeFrom(type: Type): TypeClass
 }

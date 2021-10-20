@@ -33,7 +33,7 @@ class LLVMIRLanguageBackendTest {
 
     @Test
     fun test() {
-        val file = File("src/test/resources/functiondecl.cpp")
+        val file = File("src/test/resources/binaryoperator.cpp")
         val tu = analyzeAndGetFirstTU(listOf(file), file.parentFile.toPath(), true)
 
         val backend = LLVMIRLanguageBackend()
