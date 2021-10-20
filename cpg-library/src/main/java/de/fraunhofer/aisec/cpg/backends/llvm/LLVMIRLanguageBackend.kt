@@ -26,7 +26,6 @@
 package de.fraunhofer.aisec.cpg.backends.llvm
 
 import de.fraunhofer.aisec.cpg.backends.LanguageBackend
-import de.fraunhofer.aisec.cpg.frontends.LanguageFrontend.log
 import de.fraunhofer.aisec.cpg.graph.HasType
 import de.fraunhofer.aisec.cpg.graph.NodeBuilder.newRecordDeclaration
 import de.fraunhofer.aisec.cpg.graph.declarations.*
@@ -113,12 +112,10 @@ class LLVMIRLanguageBackend : LanguageBackend<LLVMTypeRef>() {
     }
 
     private fun generateStatement(stmt: Statement) {
-        if (stmt is ReturnStatement) {
-            generateReturnStatement(stmt)
-        } else if (stmt is DeclarationStatement) {
-            generateDeclarationStatement(stmt)
-        } else if (stmt is Expression) {
-            generateExpression(stmt)
+        when (stmt) {
+            is ReturnStatement -> generateReturnStatement(stmt)
+            is DeclarationStatement -> generateDeclarationStatement(stmt)
+            is Expression -> generateExpression(stmt)
         }
     }
 
@@ -134,7 +131,10 @@ class LLVMIRLanguageBackend : LanguageBackend<LLVMTypeRef>() {
             // this later, e.g., when variables can be directly created on the stack
             val valueRef = LLVMBuildAlloca(builder, type, decl.name)
 
-            variableMap.put(decl, valueRef)
+            variableMap[decl] = valueRef
+
+            // handle the initializer as a store, if any
+            decl.initializer?.let { LLVMBuildStore(builder, generateExpression(it), valueRef) }
         }
     }
 
@@ -147,21 +147,22 @@ class LLVMIRLanguageBackend : LanguageBackend<LLVMTypeRef>() {
     }
 
     private fun generateExpression(expression: Expression): LLVMValueRef {
-        return if (expression is BinaryOperator) {
-            generateBinaryOperator(expression)
-        } else if (expression is DeclaredReferenceExpression) {
-            generateDeclRef(expression)
-        } else if (expression is Literal<*>) {
-            generateLiteral(expression)
-        } else {
-            LLVMValueRef()
+        return when (expression) {
+            is BinaryOperator -> generateBinaryOperator(expression)
+            is DeclaredReferenceExpression -> generateDeclRef(expression)
+            is Literal<*> -> generateLiteral(expression)
+            else -> LLVMValueRef()
         }
     }
 
     private fun generateLiteral(expression: Literal<*>): LLVMValueRef {
         val type = typeOf(expression)
 
-        return LLVMConstInt(type, (expression.value as Int).toLong(), 0)
+        return if (expression.value == null) {
+            LLVMConstNull(type)
+        } else {
+            LLVMConstInt(type, (expression.value as Int).toLong(), 0)
+        }
     }
 
     private fun generateBinaryOperator(expression: BinaryOperator): LLVMValueRef {
@@ -169,35 +170,27 @@ class LLVMIRLanguageBackend : LanguageBackend<LLVMTypeRef>() {
             val lhs = expression.lhs
 
             if (lhs is DeclaredReferenceExpression) {
-                val rhsValue = generateExpression(expression.rhs)
                 log.debug("Trying to store something in {}", lhs.name)
 
-                val valueRef = variableMap[(lhs as DeclaredReferenceExpression).refersTo]
+                val valueRef = variableMap[lhs.refersTo]
 
                 valueRef?.let {
-                    return LLVMBuildStore(builder, rhsValue, valueRef)
+                    return LLVMBuildStore(builder, generateExpression(expression.rhs), valueRef)
                 }
-
-                // we are storing something in our existing value
-                // lets find out what it is
-
+            } else {
+                log.error(
+                    "Left-hand side of assignment binary operation is not a reference. This assignment seems invalid."
+                )
             }
-            // lhs
-
-            // rhs
-            // LLVMBuildStore(builder, )
         } else if (expression.operatorCode == "*") {
             log.debug("Handling mul")
 
-            val valueRef =
-                LLVMBuildMul(
-                    builder,
-                    generateExpression(expression.lhs),
-                    generateExpression(expression.rhs),
-                    ""
-                )
-
-            return valueRef
+            return LLVMBuildMul(
+                builder,
+                generateExpression(expression.lhs),
+                generateExpression(expression.rhs),
+                ""
+            )
         } else if (expression.operatorCode == ">>") {
             return LLVMBuildLShr(
                 builder,
